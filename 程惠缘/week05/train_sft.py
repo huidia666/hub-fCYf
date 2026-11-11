@@ -20,7 +20,7 @@
     python train_sft.py --epochs 3                         # 快跑
     python train_sft.py --chat "12 和 34 的乘积是多少？"     # 训完直接用一句话问
     python train_sft.py --interactive                      # 交互模式，一行一句
-
+    python train_sft.py --init-from "..\\week04\\best_model_tf.pt" --save best_sft_from_pretrain.pt
 【阅读顺序】建议从上往下：常量 → 数据（最关键的 SFTDataset）→ 模型 → 训练 → 推理 → 主流程
 产出 best_sft_model.pt（权重 + 字表 + 超参 + 模板，可独立加载）
 """
@@ -250,10 +250,21 @@ def answer_question(model, char2idx, idx2char, question, device, max_new=60,
 # 存档 / 读档
 # ══════════════════════════════════════════════════════════════════
 def save_ckpt(path, model, char2idx, idx2char, args, extra=None):
-    """把「重建模型需要的一切」打包存下来，这样 .pt 可以脱离本脚本被读取。"""
-    cfg = {"d_model": args.d_model, "nhead": args.nhead, "num_layers": args.num_layers,
-           "ffn": args.ffn, "dropout": args.dropout, "max_len": MAX_LEN,
-           "vocab_size": len(char2idx)}                          # 结构超参：重建网络形状用
+    """把「重建模型需要的一切」打包存下来，这样 .pt 可以脱离本脚本被读取。
+
+    ⚠ 结构超参必须**从模型本身反读**，不能抄命令行变量：
+      用 --init-from 时，网络结构是预训练给定的（比如 192/512/4 层），
+      而命令行里的 --d_model 等仍是默认值（160/384/3），抄错就会存出一个
+      「记录的形状和权重对不上」的废档 —— 这个坑在加 --init-from 时踩过一次。
+    """
+    first = model.encoder.layers[0]                              # 拿第一层来反读结构
+    cfg = {"d_model": model.tok.embedding_dim,                   # Embedding 的维度 = d_model
+           "nhead": first.self_attn.num_heads,                   # 多头注意力的头数
+           "num_layers": len(model.encoder.layers),              # 有多少层
+           "ffn": first.linear1.out_features,                    # 前馈层中间维度
+           "dropout": first.dropout.p,                           # dropout 比例（不影响权重，仅记录）
+           "max_len": model.pos.num_embeddings,                  # 位置编码有多少个位置
+           "vocab_size": len(char2idx)}                          # 字表大小
     saved_args = dict(vars(args))                                # 把命令行参数整份存下（方便复现）
     saved_args["model"] = "transformer-sft"                      # 标记模型类型，和课堂脚本的存档约定保持一致
     payload = {"model_state": model.state_dict(),                # 权重
@@ -261,7 +272,7 @@ def save_ckpt(path, model, char2idx, idx2char, args, extra=None):
                "idx2char": idx2char,                             # id → 字
                "args": saved_args,                               # 命令行参数
                "arch": "transformer-sft",                        # 结构名
-               "model_cfg": cfg,                                 # 结构超参
+               "model_cfg": cfg,                                 # 结构超参（从模型反读）
                "template": {"user": USER, "assistant": ASSISTANT, "end": END}}   # 对话模板
     if extra:                                                    # 额外信息（最佳 PPL、第几轮）
         payload.update(extra)
@@ -278,6 +289,61 @@ def load_ckpt(path, device):
     model.load_state_dict(ckpt["model_state"])                   # 灌权重（形状对不上会在这里报错）
     model.eval()                                                 # 推理模式
     return model, ckpt["char2idx"], ckpt["idx2char"], ckpt        # 连字表和原始 ckpt 一起返回
+
+
+# ──────────────────────────────────────────────────────────────────
+# 从预训练模型出发做 SFT（--init-from）
+# 这两件事比看起来麻烦：预训练模型的字表和我们的不一样，必须先对齐再拷权重
+# ──────────────────────────────────────────────────────────────────
+def merge_pretrained_vocab(base_ckpt, rows):
+    """把预训练字表扩成 SFT 能用的字表，返回 (新字表, 反查表, 预训练字数, 新增字符列表)。
+
+    编号规则：0=<pad>，1..N=预训练原字表（顺序不动），N+1..=新增字符。
+    预训练的 0 号是 "\\n"，我们的 0 号要留给 <pad>，所以所有预训练字整体往后挪一位。
+    """
+    base_chars = [c for c, _ in sorted(base_ckpt["char2idx"].items(), key=lambda kv: kv[1])]  # 按原编号排好
+    need = set()                                                 # SFT 数据里出现过的全部字符
+    for q, a in rows:
+        need |= set(USER + q + ASSISTANT + a + END)              # 连模板一起算
+    extra = sorted(need - set(base_chars))                       # 预训练没见过的（模板里的 < | > 都在这里）
+    char2idx = {PAD: PAD_ID}                                     # 0 号给 <pad>
+    for c in base_chars:                                         # 1..N：预训练字表原封不动
+        char2idx[c] = len(char2idx)
+    for c in extra:                                              # 新增字符排在最后
+        char2idx[c] = len(char2idx)
+    idx2char = {i: c for c, i in char2idx.items()}
+    return char2idx, idx2char, len(base_chars), extra
+
+
+def init_from_pretrained(base_ckpt, char2idx, n_base, dropout):
+    """按新字表建网，然后把预训练权重「平移 + 补齐」地灌进去。"""
+    cfg = base_ckpt["model_cfg"]                                 # 预训练模型的结构超参
+    sd = base_ckpt["model_state"]                                # 预训练权重
+    model = TransformerLM(len(char2idx),                         # 新字表更大
+                          d_model=cfg["d_model"],                # 结构必须和预训练一致，否则权重对不上
+                          nhead=cfg["nhead"],
+                          num_layers=cfg["num_layers"],
+                          ffn=cfg["ffn"],
+                          dropout=dropout,                       # dropout 只是训练超参，可以重设
+                          max_len=MAX_LEN)                       # 位置编码扩容到 MAX_LEN
+    merged = {k: v.clone() for k, v in model.state_dict().items()}   # 以「新建网」的形状为底
+
+    # ① 字嵌入：预训练第 i 行 → 新表第 i+1 行（因为 0 号让给了 <pad>）
+    merged["tok.weight"].zero_()                                 # 0 号 <pad> 保持全零（Embedding 的 padding_idx 也不会更新它）
+    merged["tok.weight"][1:1 + n_base] = sd["tok.weight"]        # 预训练 4000 行整体后移一位
+    # ② 输出层同理：每一行对应一个字，也要后移
+    merged["fc.weight"][1:1 + n_base] = sd["fc.weight"]
+    merged["fc.bias"][1:1 + n_base] = sd["fc.bias"]
+    # ③ 位置编码：预训练只有 64 个位置，这里只拷前 64 行，多出来的位置保持随机初始化
+    keep = min(cfg["max_len"], MAX_LEN)
+    merged["pos.weight"][:keep] = sd["pos.weight"][:keep]
+    # ④ 其余权重（多层 Transformer、LayerNorm）形状完全一致，直接整块拷
+    for k in merged:
+        if k.startswith(("tok.", "fc.", "pos.")):                 # 前面已单独处理过的三类跳过
+            continue
+        merged[k] = sd[k]
+    model.load_state_dict(merged)                                # 灌进新建的网络
+    return model
 
 # ══════════════════════════════════════════════════════════════════
 # 主流程
@@ -298,6 +364,8 @@ def main():
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     ap.add_argument("--chat", default=None, help="不训练，直接用现有模型回答一句话")
     ap.add_argument("--interactive", action="store_true", help="不训练，进交互模式")
+    ap.add_argument("--init-from", default=None,
+                    help="从一个预训练模型出发做 SFT（比如 week4 的 best_model_tf.pt）；不给就从零训")
     args = ap.parse_args()                                       # 解析命令行
 
     device = torch.device(                                       # 选设备
@@ -334,7 +402,18 @@ def main():
 
     train_rows = read_jsonl(os.path.join(args.data_dir, "sft_train.jsonl"))   # 读训练集
     val_rows = read_jsonl(os.path.join(args.data_dir, "sft_val.jsonl"))       # 读验证集
-    char2idx, idx2char = build_vocab(train_rows + val_rows)      # 字表用两边一起统计（略乐观，但简单）
+
+    base_ckpt = None                                             # 要接预训练模型时，放这里
+    if args.init_from:                                           # ① 从 week4 的预训练模型出发
+        if not os.path.exists(args.init_from):
+            raise SystemExit(f"找不到预训练模型：{args.init_from}")
+        base_ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        char2idx, idx2char, n_base, extra = merge_pretrained_vocab(base_ckpt, train_rows + val_rows)
+        print(f"从预训练模型初始化：{os.path.basename(args.init_from)}")
+        print(f"  字表 {n_base} → {len(char2idx)}（新增 {len(extra)} 个字符，"
+              f"含模板 < | > 等）")
+    else:                                                        # ② 从零开始
+        char2idx, idx2char = build_vocab(train_rows + val_rows)  # 字表用两边一起统计（略乐观，但简单）
 
     print(f"device: {device}  model: TRANSFORMER(SFT)"
           + (f"  ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))   # 有 GPU 就报型号
@@ -347,9 +426,13 @@ def main():
                             shuffle=False, collate_fn=collate)    # 验证集：不用打乱
     print(f"batch {args.batch_size} → 每 epoch {len(train_loader)} 步\n")
 
-    model = TransformerLM(len(char2idx), d_model=args.d_model, nhead=args.nhead,
-                          num_layers=args.num_layers, ffn=args.ffn,
-                          dropout=args.dropout).to(device)        # 建网并搬到设备上
+    if base_ckpt is not None:                                    # 从预训练权重出发（结构跟预训练一致）
+        model = init_from_pretrained(base_ckpt, char2idx, n_base,
+                                     args.dropout).to(device)    # 平移字表、补位置编码
+    else:                                                        # 从零开始（结构听命令行）
+        model = TransformerLM(len(char2idx), d_model=args.d_model, nhead=args.nhead,
+                              num_layers=args.num_layers, ffn=args.ffn,
+                              dropout=args.dropout).to(device)   # 建网并搬到设备上
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")   # 参数量：衡量模型大小
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)           # ← SFT 的关键：-100 的位置直接跳过
